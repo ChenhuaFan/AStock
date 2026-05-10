@@ -1,0 +1,62 @@
+name: Daily A-share limit-up signal
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run without sending Bark notification"
+        required: false
+        default: "false"
+  schedule:
+    # 08:10 UTC = 16:10 Asia/Shanghai, after A-share close.
+    - cron: "10 8 * * 1-5"
+
+jobs:
+  signal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgomp1
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -e .
+
+      - name: Run daily signal
+        env:
+          BARK_URL: ${{ secrets.BARK_URL }}
+        run: |
+          EXTRA=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            EXTRA="--dry-run"
+          fi
+          python -m limitup_signal_bot.run_daily \
+            --universe config/universe.xlsx \
+            --up-model-dir models/up_window60 \
+            --down-model-dir models/down_window60 \
+            --output-dir outputs \
+            --top-n 10 \
+            --min-up-score 0.60 \
+            --max-down-risk 0.10 \
+            $EXTRA
+
+      - name: Upload signal artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: daily-signal-output
+          path: outputs/*.json
+          if-no-files-found: ignore
