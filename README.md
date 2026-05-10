@@ -12,6 +12,7 @@ It reads the fixed stock universe from `config/universe.xlsx`, dynamically fetch
 - Model: LightGBM raw/window_60 up model plus LightGBM raw/window_60 down-risk model.
 - Rank score: `up_score * (1 - down_risk_score)`.
 - Default filter: `up_score >= 0.60` and `down_risk_score <= 0.10`.
+- Default actionability filter: exclude stocks whose latest daily gain is `>= 9.8%`, because they are already near limit-up.
 - Default output: top 10 candidates.
 
 ## Local Run

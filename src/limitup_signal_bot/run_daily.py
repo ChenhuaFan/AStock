@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime
 import json
 import os
@@ -59,43 +58,98 @@ def score_stock(
     up_bundle: tuple[object, np.ndarray, np.ndarray],
     down_bundle: tuple[object, np.ndarray, np.ndarray],
 ) -> dict[str, object]:
-    df = fetch_history(stock.ticker, start_date=start_date, end_date=end_date, adjust=adjust, source=data_source)
-    raw_matrix = to_raw_matrix(df)
-    x_tab = build_feature(raw_matrix, window)
+    payload = fetch_feature_payload(
+        ticker=stock.ticker,
+        name=stock.name,
+        start_date=start_date,
+        end_date=end_date,
+        adjust=adjust,
+        data_source=data_source,
+        window=window,
+    )
     up_model, up_mean, up_std = up_bundle
     down_model, down_mean, down_std = down_bundle
+    x_tab = payload.pop("x_tab")
     up_score = predict_score(up_model, x_tab, up_mean, up_std)
     down_score = predict_score(down_model, x_tab, down_mean, down_std)
+    return {
+        **payload,
+        "up_score": up_score,
+        "down_risk_score": down_score,
+        "combined_score": up_score * (1.0 - down_score),
+    }
+
+
+def fetch_feature_payload(
+    ticker: str,
+    name: str,
+    start_date: str,
+    end_date: str,
+    adjust: str,
+    data_source: str,
+    window: int,
+) -> dict[str, object]:
+    df = fetch_history(ticker, start_date=start_date, end_date=end_date, adjust=adjust, source=data_source)
+    raw_matrix = to_raw_matrix(df)
+    x_tab = build_feature(raw_matrix, window)
     raw_frame = to_raw_frame(df)
     latest = raw_frame.iloc[-1].to_dict()
     return {
-        "ticker": stock.ticker,
-        "name": stock.name,
+        "ticker": ticker,
+        "name": name,
         "latest_date": latest["date"].date().isoformat(),
         "latest_close": float(latest["close"]),
         "latest_pct_chg": float(latest["pct_chg"]),
         "latest_turnover": float(latest["turnover"]),
-        "up_score": up_score,
-        "down_risk_score": down_score,
-        "combined_score": up_score * (1.0 - down_score),
         "rows": int(raw_matrix.shape[0]),
+        "x_tab": x_tab,
     }
 
 
-def format_notification(rows: list[dict[str, object]], run_date: str, min_up_score: float, max_down_risk: float) -> tuple[str, str]:
+def fetch_feature_payload_for_stock(args: tuple[str, str, str, str, str, str, int]) -> dict[str, object]:
+    ticker, name, start_date, end_date, adjust, data_source, window = args
+    return fetch_feature_payload(
+        ticker=ticker,
+        name=name,
+        start_date=start_date,
+        end_date=end_date,
+        adjust=adjust,
+        data_source=data_source,
+        window=window,
+    )
+
+
+def format_row(row: dict[str, object], idx: int) -> str:
+    return (
+        f"{idx}. {row['ticker']} {row['name']} "
+        f"up={row['up_score']:.3f} risk={row['down_risk_score']:.3f} "
+        f"score={row['combined_score']:.3f} 涨跌={row['latest_pct_chg']:.2f}%"
+    )
+
+
+def format_notification(
+    candidates: list[dict[str, object]],
+    watchlist: list[dict[str, object]],
+    run_date: str,
+    min_up_score: float,
+    max_down_risk: float,
+    excluded_latest_limitup: int,
+) -> tuple[str, str]:
     title = f"A股涨停候选 {run_date}"
-    if not rows:
-        return title, f"今日没有满足 up>={min_up_score:.2f}, risk<={max_down_risk:.2f} 的候选。"
     lines = [
         f"规则: up>={min_up_score:.2f}, risk<={max_down_risk:.2f}",
-        "Top candidates:",
+        f"已过滤今日接近涨停: {excluded_latest_limitup} 只",
     ]
-    for idx, row in enumerate(rows, start=1):
-        lines.append(
-            f"{idx}. {row['ticker']} {row['name']} "
-            f"up={row['up_score']:.3f} risk={row['down_risk_score']:.3f} "
-            f"score={row['combined_score']:.3f}"
-        )
+    if candidates:
+        lines.append("严格候选:")
+        for idx, row in enumerate(candidates, start=1):
+            lines.append(format_row(row, idx))
+    else:
+        lines.append("严格候选: 0")
+        if watchlist:
+            lines.append("观察榜: 以下不满足严格阈值，仅供参考")
+            for idx, row in enumerate(watchlist, start=1):
+                lines.append(format_row(row, idx))
     return title, "\n".join(lines)
 
 
@@ -113,12 +167,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-n", default=10, type=int)
     parser.add_argument("--min-up-score", default=0.60, type=float)
     parser.add_argument("--max-down-risk", default=0.10, type=float)
+    parser.add_argument("--exclude-latest-pct-chg-min", default=9.8, type=float)
+    parser.add_argument("--watchlist-top-n", default=5, type=int)
     parser.add_argument("--bark-url", default=os.environ.get("BARK_URL", ""))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--limit", default=0, type=int, help="Debug only: process the first N universe tickers.")
     parser.add_argument("--sleep-seconds", default=0.05, type=float)
     parser.add_argument("--progress-every", default=25, type=int)
     parser.add_argument("--workers", default=8, type=int)
+    parser.add_argument("--executor", default="process", choices=["process", "thread", "serial"])
     return parser.parse_args()
 
 
@@ -134,7 +191,8 @@ def main() -> None:
         "Config: "
         f"window={args.window}, start_date={start_date}, end_date={end_date}, "
         f"top_n={args.top_n}, min_up={args.min_up_score:.2f}, max_risk={args.max_down_risk:.2f}, "
-        f"data_source={args.data_source}, workers={args.workers}, dry_run={args.dry_run}"
+        f"exclude_latest_pct_chg_min={args.exclude_latest_pct_chg_min:.2f}, "
+        f"data_source={args.data_source}, executor={args.executor}, workers={args.workers}, dry_run={args.dry_run}"
     )
 
     log(f"Loading universe from {args.universe}")
@@ -154,24 +212,34 @@ def main() -> None:
     started = time.monotonic()
     workers = max(1, min(args.workers, len(universe) or 1))
 
-    def run_one(stock: Stock) -> dict[str, object]:
-        return score_stock(
-            stock=stock,
-            start_date=start_date,
-            end_date=end_date,
-            adjust=args.adjust,
-            data_source=args.data_source,
-            window=args.window,
-            up_bundle=up_bundle,
-            down_bundle=down_bundle,
-        )
+    def score_payload(payload: dict[str, object]) -> dict[str, object]:
+        up_model, up_mean, up_std = up_bundle
+        down_model, down_mean, down_std = down_bundle
+        x_tab = payload.pop("x_tab")
+        up_score = predict_score(up_model, x_tab, up_mean, up_std)
+        down_score = predict_score(down_model, x_tab, down_mean, down_std)
+        return {
+            **payload,
+            "up_score": up_score,
+            "down_risk_score": down_score,
+            "combined_score": up_score * (1.0 - down_score),
+        }
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_stock = {executor.submit(run_one, stock): stock for stock in universe}
-        for idx, future in enumerate(as_completed(future_to_stock), start=1):
-            stock = future_to_stock[future]
+    def fetch_args(stock: Stock) -> tuple[str, str, str, str, str, str, int]:
+        return (stock.ticker, stock.name, start_date, end_date, args.adjust, args.data_source, args.window)
+
+    if args.executor == "serial":
+        executor_cls = None
+    elif args.executor == "thread":
+        executor_cls = ThreadPoolExecutor
+    else:
+        executor_cls = ProcessPoolExecutor
+
+    if executor_cls is None:
+        for idx, stock in enumerate(universe, start=1):
             try:
-                rows.append(future.result())
+                payload = fetch_feature_payload_for_stock(fetch_args(stock))
+                rows.append(score_payload(payload))
             except Exception as exc:
                 errors.append({"ticker": stock.ticker, "name": stock.name, "error": repr(exc)})
                 log(f"WARNING: failed {stock.ticker} {stock.name}: {exc!r}")
@@ -185,29 +253,65 @@ def main() -> None:
                 )
             if args.sleep_seconds > 0 and idx < len(universe):
                 time.sleep(args.sleep_seconds)
+    else:
+        with executor_cls(max_workers=workers) as executor:
+            future_to_stock = {executor.submit(fetch_feature_payload_for_stock, fetch_args(stock)): stock for stock in universe}
+            for idx, future in enumerate(as_completed(future_to_stock), start=1):
+                stock = future_to_stock[future]
+                try:
+                    rows.append(score_payload(future.result()))
+                except Exception as exc:
+                    errors.append({"ticker": stock.ticker, "name": stock.name, "error": repr(exc)})
+                    log(f"WARNING: failed {stock.ticker} {stock.name}: {exc!r}")
+                if args.progress_every > 0 and (idx == 1 or idx % args.progress_every == 0 or idx == len(universe)):
+                    elapsed = time.monotonic() - started
+                    speed = idx / elapsed if elapsed > 0 else 0.0
+                    eta = (len(universe) - idx) / speed if speed > 0 else 0.0
+                    log(
+                        f"Progress: {idx}/{len(universe)} tickers, "
+                        f"scored={len(rows)}, errors={len(errors)}, elapsed={elapsed:.1f}s, eta={eta:.1f}s"
+                    )
+                if args.sleep_seconds > 0 and idx < len(universe):
+                    time.sleep(args.sleep_seconds)
 
     log("Scoring finished; ranking candidates")
     rows.sort(key=lambda row: row["combined_score"], reverse=True)
+    eligible_rows = [row for row in rows if row["latest_pct_chg"] < args.exclude_latest_pct_chg_min]
+    excluded_latest_limitup = len(rows) - len(eligible_rows)
     candidates = [
         row
-        for row in rows
+        for row in eligible_rows
         if row["up_score"] >= args.min_up_score and row["down_risk_score"] <= args.max_down_risk
     ][: args.top_n]
-    fallback_used = False
-    if not candidates:
-        candidates = rows[: args.top_n]
-        fallback_used = True
-        log("No ticker matched strict thresholds; falling back to top ranked rows")
-    log(f"Selected {len(candidates)} candidates; fallback_used={fallback_used}")
+    watchlist = eligible_rows[: args.watchlist_top_n] if not candidates else []
+    log(
+        f"Selected {len(candidates)} strict candidates; "
+        f"watchlist={len(watchlist)}, excluded_latest_limitup={excluded_latest_limitup}"
+    )
     for idx, row in enumerate(candidates[: min(5, len(candidates))], start=1):
         log(
             f"Top {idx}: {row['ticker']} {row['name']} "
             f"up={row['up_score']:.4f}, risk={row['down_risk_score']:.4f}, "
             f"score={row['combined_score']:.4f}, latest={row['latest_date']}"
         )
+    if not candidates:
+        for idx, row in enumerate(watchlist[: min(5, len(watchlist))], start=1):
+            log(
+                f"Watch {idx}: {row['ticker']} {row['name']} "
+                f"up={row['up_score']:.4f}, risk={row['down_risk_score']:.4f}, "
+                f"score={row['combined_score']:.4f}, latest={row['latest_date']}, "
+                f"latest_pct_chg={row['latest_pct_chg']:.2f}%"
+            )
 
     run_date = now.strftime("%Y-%m-%d")
-    title, body = format_notification(candidates, run_date, args.min_up_score, args.max_down_risk)
+    title, body = format_notification(
+        candidates=candidates,
+        watchlist=watchlist,
+        run_date=run_date,
+        min_up_score=args.min_up_score,
+        max_down_risk=args.max_down_risk,
+        excluded_latest_limitup=excluded_latest_limitup,
+    )
     notification = {"sent": False, "dry_run": args.dry_run}
     if not args.dry_run:
         log("Sending Bark notification")
@@ -226,14 +330,20 @@ def main() -> None:
         "universe_size": len(universe),
         "scored": len(rows),
         "errors": errors,
-        "fallback_used": fallback_used,
+        "strict_candidates": len(candidates),
+        "watchlist_count": len(watchlist),
+        "excluded_latest_limitup": excluded_latest_limitup,
         "rules": {
             "rank_score": "up_score * (1 - down_risk_score)",
             "min_up_score": args.min_up_score,
             "max_down_risk": args.max_down_risk,
+            "exclude_latest_pct_chg_min": args.exclude_latest_pct_chg_min,
             "top_n": args.top_n,
         },
         "top": candidates,
+        "watchlist": watchlist,
+        "notification_title": title,
+        "notification_body": body,
         "notification": notification,
     }
     output_path = args.output_dir / f"signals_{run_date}.json"
@@ -242,7 +352,19 @@ def main() -> None:
 
     log(f"Wrote output: {output_path}")
     log("Daily limit-up signal job finished")
-    print(json.dumps({"output": str(output_path), "top": candidates, "errors": errors[:10], "notification": notification}, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "output": str(output_path),
+                "top": candidates,
+                "watchlist": watchlist,
+                "errors": errors[:10],
+                "notification": notification,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

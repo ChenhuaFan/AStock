@@ -84,12 +84,19 @@ def fetch_history(
         raise ValueError(f"Unsupported data source: {source}")
 
     if source == "daily":
-        return ak.stock_zh_a_daily(
-            symbol=_exchange_symbol(symbol),
-            start_date=start_date,
-            end_date=end_date,
-            adjust=adjust,
-        )
+        last_error: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                return ak.stock_zh_a_daily(
+                    symbol=_exchange_symbol(symbol),
+                    start_date=start_date,
+                    end_date=end_date,
+                    adjust=adjust,
+                )
+            except Exception as exc:
+                last_error = exc
+                time.sleep(0.5 + attempt * 0.5)
+        raise RuntimeError(f"daily failed: {last_error!r}")
 
     last_error: Exception | None = None
     for attempt in range(retries + 1):

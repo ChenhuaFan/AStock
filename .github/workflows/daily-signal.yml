@@ -62,7 +62,10 @@ jobs:
             --top-n 10 \
             --min-up-score 0.60 \
             --max-down-risk 0.10 \
+            --exclude-latest-pct-chg-min 9.80 \
+            --watchlist-top-n 5 \
             --data-source daily \
+            --executor process \
             --workers 8 \
             --sleep-seconds 0 \
             --progress-every 25 \
