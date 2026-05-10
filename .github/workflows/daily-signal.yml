@@ -38,12 +38,23 @@ jobs:
       - name: Run daily signal
         env:
           BARK_URL: ${{ secrets.BARK_URL }}
+          PYTHONUNBUFFERED: "1"
         run: |
+          echo "::group::Runtime context"
+          date -u
+          python --version
+          echo "Working directory: $(pwd)"
+          echo "Dry run input: ${{ github.event.inputs.dry_run }}"
+          echo "BARK_URL configured: $([ -n "$BARK_URL" ] && echo yes || echo no)"
+          echo "::endgroup::"
+
           EXTRA=""
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
             EXTRA="--dry-run"
           fi
-          python -m limitup_signal_bot.run_daily \
+
+          echo "::group::Daily signal run"
+          python -u -m limitup_signal_bot.run_daily \
             --universe config/universe.xlsx \
             --up-model-dir models/up_window60 \
             --down-model-dir models/down_window60 \
@@ -51,7 +62,13 @@ jobs:
             --top-n 10 \
             --min-up-score 0.60 \
             --max-down-risk 0.10 \
+            --progress-every 25 \
             $EXTRA
+          echo "::endgroup::"
+
+          echo "::group::Generated outputs"
+          ls -lh outputs || true
+          echo "::endgroup::"
 
       - name: Upload signal artifact
         uses: actions/upload-artifact@v4

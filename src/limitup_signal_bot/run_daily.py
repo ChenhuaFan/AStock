@@ -23,6 +23,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CN_TZ = ZoneInfo("Asia/Shanghai")
 
 
+def log(message: str) -> None:
+    timestamp = datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}", flush=True)
+
+
 def load_model_bundle(model_dir: Path) -> tuple[object, np.ndarray, np.ndarray]:
     with (model_dir / "model.pkl").open("rb") as f:
         model = pickle.load(f)
@@ -109,6 +114,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--limit", default=0, type=int, help="Debug only: process the first N universe tickers.")
     parser.add_argument("--sleep-seconds", default=0.05, type=float)
+    parser.add_argument("--progress-every", default=25, type=int)
     return parser.parse_args()
 
 
@@ -119,14 +125,29 @@ def main() -> None:
     end_date = args.end_date or now.strftime("%Y%m%d")
     start_date = default_start_date(datetime.strptime(end_date, "%Y%m%d").date(), args.lookback_calendar_days)
 
+    log("Starting daily limit-up signal job")
+    log(
+        "Config: "
+        f"window={args.window}, start_date={start_date}, end_date={end_date}, "
+        f"top_n={args.top_n}, min_up={args.min_up_score:.2f}, max_risk={args.max_down_risk:.2f}, "
+        f"dry_run={args.dry_run}"
+    )
+
+    log(f"Loading universe from {args.universe}")
     universe = load_universe(args.universe)
     if args.limit:
         universe = universe[: args.limit]
+        log(f"Debug limit enabled: processing first {len(universe)} tickers")
+    log(f"Universe loaded: {len(universe)} tickers")
+    log(f"Loading up model from {args.up_model_dir}")
     up_bundle = load_model_bundle(args.up_model_dir)
+    log(f"Loading down-risk model from {args.down_model_dir}")
     down_bundle = load_model_bundle(args.down_model_dir)
+    log("Models loaded")
 
     rows: list[dict[str, object]] = []
     errors: list[dict[str, str]] = []
+    started = time.monotonic()
     for idx, stock in enumerate(universe, start=1):
         try:
             rows.append(
@@ -142,9 +163,17 @@ def main() -> None:
             )
         except Exception as exc:
             errors.append({"ticker": stock.ticker, "name": stock.name, "error": repr(exc)})
+            log(f"WARNING: failed {stock.ticker} {stock.name}: {exc!r}")
+        if args.progress_every > 0 and (idx == 1 or idx % args.progress_every == 0 or idx == len(universe)):
+            elapsed = time.monotonic() - started
+            log(
+                f"Progress: {idx}/{len(universe)} tickers, "
+                f"scored={len(rows)}, errors={len(errors)}, elapsed={elapsed:.1f}s"
+            )
         if args.sleep_seconds > 0 and idx < len(universe):
             time.sleep(args.sleep_seconds)
 
+    log("Scoring finished; ranking candidates")
     rows.sort(key=lambda row: row["combined_score"], reverse=True)
     candidates = [
         row
@@ -155,12 +184,24 @@ def main() -> None:
     if not candidates:
         candidates = rows[: args.top_n]
         fallback_used = True
+        log("No ticker matched strict thresholds; falling back to top ranked rows")
+    log(f"Selected {len(candidates)} candidates; fallback_used={fallback_used}")
+    for idx, row in enumerate(candidates[: min(5, len(candidates))], start=1):
+        log(
+            f"Top {idx}: {row['ticker']} {row['name']} "
+            f"up={row['up_score']:.4f}, risk={row['down_risk_score']:.4f}, "
+            f"score={row['combined_score']:.4f}, latest={row['latest_date']}"
+        )
 
     run_date = now.strftime("%Y-%m-%d")
     title, body = format_notification(candidates, run_date, args.min_up_score, args.max_down_risk)
     notification = {"sent": False, "dry_run": args.dry_run}
     if not args.dry_run:
+        log("Sending Bark notification")
         notification = send_bark(args.bark_url, title=title, body=body)
+        log(f"Bark response: {notification}")
+    else:
+        log("Dry-run enabled; skipping Bark notification")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     result = {
@@ -186,6 +227,8 @@ def main() -> None:
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
+    log(f"Wrote output: {output_path}")
+    log("Daily limit-up signal job finished")
     print(json.dumps({"output": str(output_path), "top": candidates, "errors": errors[:10], "notification": notification}, ensure_ascii=False, indent=2))
 
 
