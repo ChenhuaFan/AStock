@@ -72,7 +72,25 @@ def to_raw_matrix(df: pd.DataFrame) -> np.ndarray:
     return frame[RAW_COLUMNS].to_numpy(dtype=np.float32)
 
 
-def fetch_history(symbol: str, start_date: str, end_date: str, adjust: str = "", retries: int = 2) -> pd.DataFrame:
+def fetch_history(
+    symbol: str,
+    start_date: str,
+    end_date: str,
+    adjust: str = "",
+    source: str = "daily",
+    retries: int = 1,
+) -> pd.DataFrame:
+    if source not in {"daily", "hist", "auto"}:
+        raise ValueError(f"Unsupported data source: {source}")
+
+    if source == "daily":
+        return ak.stock_zh_a_daily(
+            symbol=_exchange_symbol(symbol),
+            start_date=start_date,
+            end_date=end_date,
+            adjust=adjust,
+        )
+
     last_error: Exception | None = None
     for attempt in range(retries + 1):
         try:
@@ -86,6 +104,9 @@ def fetch_history(symbol: str, start_date: str, end_date: str, adjust: str = "",
         except Exception as exc:
             last_error = exc
             time.sleep(0.5 + attempt * 0.5)
+
+    if source == "hist":
+        raise RuntimeError(f"hist failed: {last_error!r}")
 
     try:
         return ak.stock_zh_a_daily(

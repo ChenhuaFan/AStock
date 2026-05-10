@@ -8,6 +8,7 @@ It reads the fixed stock universe from `config/universe.xlsx`, dynamically fetch
 
 - Universe: stocks in `config/universe.xlsx`.
 - Data: fetched dynamically with `akshare.stock_zh_a_hist`; no dependency on local historical `.npy` files.
+- Default source in automation: `akshare.stock_zh_a_daily`, fetched concurrently with 8 workers for speed.
 - Model: LightGBM raw/window_60 up model plus LightGBM raw/window_60 down-risk model.
 - Rank score: `up_score * (1 - down_risk_score)`.
 - Default filter: `up_score >= 0.60` and `down_risk_score <= 0.10`.
@@ -21,7 +22,7 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 
-PYTHONPATH=src python -m limitup_signal_bot.run_daily --dry-run --limit 5
+PYTHONPATH=src python -m limitup_signal_bot.run_daily --dry-run --limit 5 --workers 4 --progress-every 1
 ```
 
 Send a Bark notification locally:
@@ -62,3 +63,5 @@ You can also run it manually from the Actions tab with `workflow_dispatch`.
 ## Notes
 
 AkShare data availability can lag after market close. If a vendor delay happens, the bot still scores the latest available trading day in the fetched data and includes `latest_date` in the output.
+
+The data fetcher supports `--data-source daily`, `--data-source hist`, and `--data-source auto`. The GitHub Action uses `daily` because it is much faster and more stable for the full universe. Increase `--workers` cautiously if the vendor endpoint is healthy; decrease it if you see throttling or many connection errors.

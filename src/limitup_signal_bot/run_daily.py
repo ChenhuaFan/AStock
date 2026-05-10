@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime
 import json
@@ -53,11 +54,12 @@ def score_stock(
     start_date: str,
     end_date: str,
     adjust: str,
+    data_source: str,
     window: int,
     up_bundle: tuple[object, np.ndarray, np.ndarray],
     down_bundle: tuple[object, np.ndarray, np.ndarray],
 ) -> dict[str, object]:
-    df = fetch_history(stock.ticker, start_date=start_date, end_date=end_date, adjust=adjust)
+    df = fetch_history(stock.ticker, start_date=start_date, end_date=end_date, adjust=adjust, source=data_source)
     raw_matrix = to_raw_matrix(df)
     x_tab = build_feature(raw_matrix, window)
     up_model, up_mean, up_std = up_bundle
@@ -107,6 +109,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lookback-calendar-days", default=260, type=int)
     parser.add_argument("--end-date", default="")
     parser.add_argument("--adjust", default="")
+    parser.add_argument("--data-source", default="daily", choices=["daily", "hist", "auto"])
     parser.add_argument("--top-n", default=10, type=int)
     parser.add_argument("--min-up-score", default=0.60, type=float)
     parser.add_argument("--max-down-risk", default=0.10, type=float)
@@ -115,6 +118,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", default=0, type=int, help="Debug only: process the first N universe tickers.")
     parser.add_argument("--sleep-seconds", default=0.05, type=float)
     parser.add_argument("--progress-every", default=25, type=int)
+    parser.add_argument("--workers", default=8, type=int)
     return parser.parse_args()
 
 
@@ -130,7 +134,7 @@ def main() -> None:
         "Config: "
         f"window={args.window}, start_date={start_date}, end_date={end_date}, "
         f"top_n={args.top_n}, min_up={args.min_up_score:.2f}, max_risk={args.max_down_risk:.2f}, "
-        f"dry_run={args.dry_run}"
+        f"data_source={args.data_source}, workers={args.workers}, dry_run={args.dry_run}"
     )
 
     log(f"Loading universe from {args.universe}")
@@ -148,30 +152,39 @@ def main() -> None:
     rows: list[dict[str, object]] = []
     errors: list[dict[str, str]] = []
     started = time.monotonic()
-    for idx, stock in enumerate(universe, start=1):
-        try:
-            rows.append(
-                score_stock(
-                    stock=stock,
-                    start_date=start_date,
-                    end_date=end_date,
-                    adjust=args.adjust,
-                    window=args.window,
-                    up_bundle=up_bundle,
-                    down_bundle=down_bundle,
+    workers = max(1, min(args.workers, len(universe) or 1))
+
+    def run_one(stock: Stock) -> dict[str, object]:
+        return score_stock(
+            stock=stock,
+            start_date=start_date,
+            end_date=end_date,
+            adjust=args.adjust,
+            data_source=args.data_source,
+            window=args.window,
+            up_bundle=up_bundle,
+            down_bundle=down_bundle,
+        )
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_stock = {executor.submit(run_one, stock): stock for stock in universe}
+        for idx, future in enumerate(as_completed(future_to_stock), start=1):
+            stock = future_to_stock[future]
+            try:
+                rows.append(future.result())
+            except Exception as exc:
+                errors.append({"ticker": stock.ticker, "name": stock.name, "error": repr(exc)})
+                log(f"WARNING: failed {stock.ticker} {stock.name}: {exc!r}")
+            if args.progress_every > 0 and (idx == 1 or idx % args.progress_every == 0 or idx == len(universe)):
+                elapsed = time.monotonic() - started
+                speed = idx / elapsed if elapsed > 0 else 0.0
+                eta = (len(universe) - idx) / speed if speed > 0 else 0.0
+                log(
+                    f"Progress: {idx}/{len(universe)} tickers, "
+                    f"scored={len(rows)}, errors={len(errors)}, elapsed={elapsed:.1f}s, eta={eta:.1f}s"
                 )
-            )
-        except Exception as exc:
-            errors.append({"ticker": stock.ticker, "name": stock.name, "error": repr(exc)})
-            log(f"WARNING: failed {stock.ticker} {stock.name}: {exc!r}")
-        if args.progress_every > 0 and (idx == 1 or idx % args.progress_every == 0 or idx == len(universe)):
-            elapsed = time.monotonic() - started
-            log(
-                f"Progress: {idx}/{len(universe)} tickers, "
-                f"scored={len(rows)}, errors={len(errors)}, elapsed={elapsed:.1f}s"
-            )
-        if args.sleep_seconds > 0 and idx < len(universe):
-            time.sleep(args.sleep_seconds)
+            if args.sleep_seconds > 0 and idx < len(universe):
+                time.sleep(args.sleep_seconds)
 
     log("Scoring finished; ranking candidates")
     rows.sort(key=lambda row: row["combined_score"], reverse=True)
