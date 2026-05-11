@@ -1,4 +1,4 @@
-name: Daily A-share limit-up signal
+name: Intraday A-share limit-up signal
 
 on:
   workflow_dispatch:
@@ -8,8 +8,8 @@ on:
         required: false
         default: "false"
   schedule:
-    # 08:10 UTC = 16:10 Asia/Shanghai, after A-share close.
-    - cron: "10 8 * * 1-5"
+    # 06:30 UTC = 14:30 Asia/Shanghai, for the final 30 minutes decision window.
+    - cron: "30 6 * * 1-5"
 
 jobs:
   signal:
@@ -64,7 +64,8 @@ jobs:
             --max-down-risk 0.10 \
             --exclude-latest-pct-chg-min 9.80 \
             --watchlist-top-n 5 \
-            --data-source daily \
+            --data-source intraday \
+            --intraday-time 14:30 \
             --executor process \
             --workers 8 \
             --sleep-seconds 0 \

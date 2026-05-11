@@ -55,6 +55,7 @@ def score_stock(
     end_date: str,
     adjust: str,
     data_source: str,
+    intraday_time: str,
     window: int,
     up_bundle: tuple[object, np.ndarray, np.ndarray],
     down_bundle: tuple[object, np.ndarray, np.ndarray],
@@ -66,6 +67,7 @@ def score_stock(
         end_date=end_date,
         adjust=adjust,
         data_source=data_source,
+        intraday_time=intraday_time,
         window=window,
     )
     up_model, up_mean, up_std = up_bundle
@@ -88,9 +90,17 @@ def fetch_feature_payload(
     end_date: str,
     adjust: str,
     data_source: str,
+    intraday_time: str,
     window: int,
 ) -> dict[str, object]:
-    df = fetch_history(ticker, start_date=start_date, end_date=end_date, adjust=adjust, source=data_source)
+    df = fetch_history(
+        ticker,
+        start_date=start_date,
+        end_date=end_date,
+        adjust=adjust,
+        source=data_source,
+        intraday_time=intraday_time,
+    )
     raw_matrix = to_raw_matrix(df)
     x_tab = build_feature(raw_matrix, window)
     raw_frame = to_raw_frame(df)
@@ -107,8 +117,8 @@ def fetch_feature_payload(
     }
 
 
-def fetch_feature_payload_for_stock(args: tuple[str, str, str, str, str, str, int]) -> dict[str, object]:
-    ticker, name, start_date, end_date, adjust, data_source, window = args
+def fetch_feature_payload_for_stock(args: tuple[str, str, str, str, str, str, str, int]) -> dict[str, object]:
+    ticker, name, start_date, end_date, adjust, data_source, intraday_time, window = args
     return fetch_feature_payload(
         ticker=ticker,
         name=name,
@@ -116,6 +126,7 @@ def fetch_feature_payload_for_stock(args: tuple[str, str, str, str, str, str, in
         end_date=end_date,
         adjust=adjust,
         data_source=data_source,
+        intraday_time=intraday_time,
         window=window,
     )
 
@@ -136,9 +147,12 @@ def format_notification(
     max_down_risk: float,
     excluded_latest_limitup: int,
     latest_date_summary: str,
+    data_source: str,
+    intraday_time: str,
 ) -> tuple[str, str]:
-    title = f"A股涨停候选 {run_date}"
+    title = f"A股盘中涨停候选 {run_date}" if data_source == "intraday" else f"A股涨停候选 {run_date}"
     lines = [
+        f"数据模式: {data_source}" + (f" 截至 {intraday_time}" if data_source == "intraday" else ""),
         f"数据日期: {latest_date_summary}",
         f"规则: up>={min_up_score:.2f}, risk<={max_down_risk:.2f}",
         f"已过滤今日接近涨停: {excluded_latest_limitup} 只",
@@ -166,7 +180,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lookback-calendar-days", default=260, type=int)
     parser.add_argument("--end-date", default="")
     parser.add_argument("--adjust", default="")
-    parser.add_argument("--data-source", default="daily", choices=["daily", "hist", "auto"])
+    parser.add_argument("--data-source", default="daily", choices=["daily", "hist", "auto", "intraday"])
+    parser.add_argument("--intraday-time", default="14:30")
     parser.add_argument("--top-n", default=10, type=int)
     parser.add_argument("--min-up-score", default=0.60, type=float)
     parser.add_argument("--max-down-risk", default=0.10, type=float)
@@ -195,7 +210,8 @@ def main() -> None:
         f"window={args.window}, start_date={start_date}, end_date={end_date}, "
         f"top_n={args.top_n}, min_up={args.min_up_score:.2f}, max_risk={args.max_down_risk:.2f}, "
         f"exclude_latest_pct_chg_min={args.exclude_latest_pct_chg_min:.2f}, "
-        f"data_source={args.data_source}, executor={args.executor}, workers={args.workers}, dry_run={args.dry_run}"
+        f"data_source={args.data_source}, intraday_time={args.intraday_time}, "
+        f"executor={args.executor}, workers={args.workers}, dry_run={args.dry_run}"
     )
 
     log(f"Loading universe from {args.universe}")
@@ -228,8 +244,17 @@ def main() -> None:
             "combined_score": up_score * (1.0 - down_score),
         }
 
-    def fetch_args(stock: Stock) -> tuple[str, str, str, str, str, str, int]:
-        return (stock.ticker, stock.name, start_date, end_date, args.adjust, args.data_source, args.window)
+    def fetch_args(stock: Stock) -> tuple[str, str, str, str, str, str, str, int]:
+        return (
+            stock.ticker,
+            stock.name,
+            start_date,
+            end_date,
+            args.adjust,
+            args.data_source,
+            args.intraday_time,
+            args.window,
+        )
 
     if args.executor == "serial":
         executor_cls = None
@@ -318,6 +343,8 @@ def main() -> None:
         max_down_risk=args.max_down_risk,
         excluded_latest_limitup=excluded_latest_limitup,
         latest_date_summary=latest_date_summary,
+        data_source=args.data_source,
+        intraday_time=args.intraday_time,
     )
     notification = {"sent": False, "dry_run": args.dry_run}
     if not args.dry_run:
@@ -332,6 +359,8 @@ def main() -> None:
         "run_at": now.isoformat(),
         "start_date": start_date,
         "end_date": end_date,
+        "data_source": args.data_source,
+        "intraday_time": args.intraday_time,
         "window": args.window,
         "universe_file": str(args.universe),
         "universe_size": len(universe),
@@ -347,6 +376,8 @@ def main() -> None:
             "max_down_risk": args.max_down_risk,
             "exclude_latest_pct_chg_min": args.exclude_latest_pct_chg_min,
             "top_n": args.top_n,
+            "data_source": args.data_source,
+            "intraday_time": args.intraday_time,
         },
         "top": candidates,
         "watchlist": watchlist,
