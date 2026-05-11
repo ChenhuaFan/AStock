@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from collections import Counter
 from datetime import datetime
 import json
 import os
@@ -134,9 +135,11 @@ def format_notification(
     min_up_score: float,
     max_down_risk: float,
     excluded_latest_limitup: int,
+    latest_date_summary: str,
 ) -> tuple[str, str]:
     title = f"A股涨停候选 {run_date}"
     lines = [
+        f"数据日期: {latest_date_summary}",
         f"规则: up>={min_up_score:.2f}, risk<={max_down_risk:.2f}",
         f"已过滤今日接近涨停: {excluded_latest_limitup} 只",
     ]
@@ -276,6 +279,9 @@ def main() -> None:
 
     log("Scoring finished; ranking candidates")
     rows.sort(key=lambda row: row["combined_score"], reverse=True)
+    latest_date_counts = dict(Counter(str(row["latest_date"]) for row in rows).most_common())
+    latest_date_summary = ", ".join(f"{day}:{count}" for day, count in list(latest_date_counts.items())[:3])
+    log(f"Latest data date distribution: {latest_date_summary}")
     eligible_rows = [row for row in rows if row["latest_pct_chg"] < args.exclude_latest_pct_chg_min]
     excluded_latest_limitup = len(rows) - len(eligible_rows)
     candidates = [
@@ -311,6 +317,7 @@ def main() -> None:
         min_up_score=args.min_up_score,
         max_down_risk=args.max_down_risk,
         excluded_latest_limitup=excluded_latest_limitup,
+        latest_date_summary=latest_date_summary,
     )
     notification = {"sent": False, "dry_run": args.dry_run}
     if not args.dry_run:
@@ -330,6 +337,7 @@ def main() -> None:
         "universe_size": len(universe),
         "scored": len(rows),
         "errors": errors,
+        "latest_date_counts": latest_date_counts,
         "strict_candidates": len(candidates),
         "watchlist_count": len(watchlist),
         "excluded_latest_limitup": excluded_latest_limitup,
